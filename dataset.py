@@ -2,10 +2,20 @@ import argparse
 import better_exceptions
 from pathlib import Path
 import numpy as np
+if "bool" not in np.__dict__:
+    np.bool = np.bool_
 import pandas as pd
 import torch
 import cv2
 from torch.utils.data import Dataset
+import collections
+import collections.abc
+
+# Fix for imgaug's use of collections.Iterable
+if not hasattr(collections, 'Iterable'):
+    collections.Iterable = collections.abc.Iterable
+from imgaug import augmenters as iaa
+
 from imgaug import augmenters as iaa
 
 
