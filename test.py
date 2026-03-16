@@ -1,22 +1,15 @@
 import argparse
-import better_exceptions
 from pathlib import Path
 import numpy as np
 import cv2
 import torch
-import torch.nn.parallel
 import torch.backends.cudnn as cudnn
-import torch.optim
-import torch.utils.data
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import pretrainedmodels
-import pretrainedmodels.utils
 from model import get_model
 from dataset import FaceDataset
 from defaults import _C as cfg
-from train import validate
-
 
 def get_args():
     model_names = sorted(name for name in pretrainedmodels.__dict__
@@ -28,6 +21,7 @@ def get_args():
     parser.add_argument("--data_dir", type=str, required=True, help="Data root directory")
     parser.add_argument("--resume", type=str, required=True, help="Model weight to be tested")
     parser.add_argument("--tta", action='store_true', help="Enable standard TTA (30 versions: 2 flips × 5 crops × 3 scales)")
+    parser.add_argument("--weights", type=str, default=None, help="Path to learned TTA weights (.pth)")
     parser.add_argument("opts", default=[], nargs=argparse.REMAINDER,
                         help="Modify config options using the command-line")
     args = parser.parse_args()
@@ -67,49 +61,88 @@ def generate_tta_versions(img, target_size=224, scales=[1.0, 1.04, 1.10]):
     return versions
 
 
-def validate_with_tta(validate_loader, model, device):
+def validate(validate_loader, model, device, dataset):
     model.eval()
     preds = []
     gt = []
+    paths = []
+
+    with torch.no_grad():
+        with tqdm(validate_loader) as _tqdm:
+            for x, y in _tqdm:
+                x = x.to(device)
+                y = y.to(device)
+
+                outputs = model(x)
+                probs = torch.softmax(outputs, dim=-1).cpu().numpy()
+                preds.append(probs)
+                gt.append(y.cpu().numpy())
+
+    preds = np.concatenate(preds, axis=0)
+    gt = np.concatenate(gt, axis=0)
+    ages = np.arange(0, 101)
+    pred_ages = (preds * ages).sum(axis=-1)
     
+    # Return image paths and predictions
+    paths = dataset.x
+    return pred_ages, paths
+
+
+def apply_weighted_logits(logits_stack, weights=None):
+    """
+    logits_stack: [num_augs, num_classes]
+    weights: None (simple average) or tensor [num_augs] (AugTTA)
+    """
+    if weights is None:
+        weighted = logits_stack.mean(dim=0)
+    elif weights.ndim == 1:
+        # AugTTA: weights shape [num_augs] -> broadcast to [num_augs, 1]
+        weighted = (logits_stack * weights.view(-1, 1)).sum(dim=0)
+    else:
+        raise ValueError(f"Unexpected weights shape: {weights.shape}")
+    return weighted
+
+
+def validate_with_tta(validate_loader, model, device, dataset, weights=None):
+    """
+    If weights is None, uses simple average. Otherwise uses learned weights.
+    Returns predicted ages and image paths.
+    """
+    model.eval()
+    all_pred_ages = []
+    paths = []
+    
+    ages = np.arange(0, 101)
+
     with torch.no_grad():
         with tqdm(validate_loader) as _tqdm:
             for x, y in _tqdm:
                 batch_size = x.size(0)
-                
                 for img_idx in range(batch_size):
-                    # Get single image: x is (batch, C, H, W), convert to (H, W, C) BGR
-                    single_img_tensor = x[img_idx].cpu().numpy()  # (C, H, W)
-                    single_img = np.transpose(single_img_tensor, (1, 2, 0)).astype(np.uint8)  # (H, W, C)
-                    single_y = y[img_idx].item()
-                    
-                    # Generate 30 TTA versions from this image
+                    single_img_tensor = x[img_idx].cpu().numpy()
+                    single_img = np.transpose(single_img_tensor, (1, 2, 0)).astype(np.uint8)
+
                     aug_imgs = generate_tta_versions(single_img, target_size=cfg.MODEL.IMG_SIZE)
-                    
-                    # Run inference on all versions and collect probabilities
-                    tta_probs = []
+
+                    # Collect logits for all augmentations
+                    logits_list = []
                     for aug_img in aug_imgs:
                         aug_img_float = aug_img.astype(np.float32)
                         tensor = torch.from_numpy(np.transpose(aug_img_float, (2, 0, 1))).unsqueeze(0).to(device)
-                        outputs = model(tensor)
-                        probs = torch.softmax(outputs, dim=-1).cpu().numpy()[0]
-                        tta_probs.append(probs)
-                    
-                    # Average probabilities
-                    avg_probs = np.mean(tta_probs, axis=0)
-                    preds.append(avg_probs)
-                    gt.append(single_y)
-                
-                _tqdm.update(1)
+                        logits = model(tensor)  # [1, num_classes]
+                        logits_list.append(logits.squeeze(0))
+                    logits_stack = torch.stack(logits_list, dim=0).to(device)  # [num_augs, num_classes]
+
+                    # Apply weighting
+                    weighted_logits = apply_weighted_logits(logits_stack, weights)
+                    probs = torch.softmax(weighted_logits, dim=-1).cpu().numpy()
+                    pred_age = (probs * ages).sum()
+                    all_pred_ages.append(pred_age)
+
+    all_pred_ages = np.array(all_pred_ages)
+    paths = dataset.x
     
-    preds = np.array(preds)
-    gt = np.array(gt)
-    ages = np.arange(0, 101)
-    ave_preds = (preds * ages).sum(axis=-1)
-    diff = ave_preds - gt
-    mae = np.abs(diff).mean()
-    
-    return mae
+    return all_pred_ages, paths
 
 
 def main():
@@ -140,17 +173,35 @@ def main():
     if device == "cuda":
         cudnn.benchmark = True
 
+    # load test dataset
     test_dataset = FaceDataset(args.data_dir, "test", img_size=cfg.MODEL.IMG_SIZE, augment=False)
     test_loader = DataLoader(test_dataset, batch_size=cfg.TEST.BATCH_SIZE, shuffle=False,
                              num_workers=cfg.TRAIN.WORKERS, drop_last=False)
 
+    # load weights if provided
+    weights = None
+    if args.weights:
+        w = torch.load(args.weights, map_location='cpu')
+        weights = w['weights'].float().to(device)
+        method = w.get('method', 'aug')
+        print(f"Loaded learned TTA weights from {args.weights} (method: {method})")
+        print(f"Weights shape: {weights.shape}")
+
     print("=> start testing")
     if args.tta:
-        print("=> using test-time augmentation (30 versions per image)")
-        test_mae = validate_with_tta(test_loader, model, device)
+        pred_ages, paths = validate_with_tta(test_loader, model, device, test_dataset, weights=weights)
+        file_name = "image_mean_tta.txt" if not args.weights else "image_mean_tta_weighted.txt"
     else:
-        _, _, test_mae = validate(test_loader, model, None, 0, device)
-    print(f"test mae: {test_mae:.3f}")
+        pred_ages, paths = validate(test_loader, model, device, test_dataset)
+        file_name = "image_mean_non_tta.txt"
+
+    # Save predictions to file
+    out_dir = Path("./test_results")
+    out_dir.mkdir(exist_ok=True)
+    
+    with open(out_dir / file_name, "w") as f:
+        for path, pred in zip(paths, pred_ages):
+            f.write(f"{path} {pred:.4f}\n")
 
 
 if __name__ == '__main__':
