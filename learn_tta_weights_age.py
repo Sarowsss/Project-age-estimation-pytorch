@@ -62,14 +62,13 @@ def train_tta_weights_age(model, val_dataset, device,
             tta_logits = torch.zeros(batch_size, n_augs, n_classes, device=device)
 
             for i in range(batch_size):
-                img = imgs[i].cpu().numpy().transpose(1, 2, 0)
-                img = (img * 255).astype(np.uint8)
+                img = imgs[i].cpu().numpy().transpose(1, 2, 0).astype(np.uint8)
                 tta_versions = generate_tta_versions(img)
 
                 for aug_idx, aug_img in enumerate(tta_versions):
-                    aug_tensor = torch.from_numpy(aug_img).float().permute(2, 0, 1) / 255.0
-                    aug_tensor = (aug_tensor - 0.5) / 0.5
-                    aug_tensor = aug_tensor.unsqueeze(0).to(device)
+                    aug_tensor = torch.from_numpy(
+                        np.transpose(aug_img.astype(np.float32), (2, 0, 1))
+                    ).unsqueeze(0).to(device)
 
                     logits = model(aug_tensor)
                     tta_logits[i, aug_idx] = logits.squeeze(0)
@@ -162,6 +161,10 @@ def get_args():
                         help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=0.01,
                         help="Learning rate")
+    parser.add_argument("--n_augs", type=int, default=30,
+                        help="Number of TTA augmentations (must match generate_tta_versions output)")
+    parser.add_argument("--output_dir", type=str, default="./tta_weights_learned",
+                        help="Directory to save learned TTA weights")
     args = parser.parse_args()
     return args
 
