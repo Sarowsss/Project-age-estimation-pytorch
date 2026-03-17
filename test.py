@@ -61,11 +61,10 @@ def generate_tta_versions(img, target_size=224, scales=[1.0, 1.04, 1.10]):
     return versions
 
 
-def validate(validate_loader, model, device, dataset):
+def validate(validate_loader, model, device, dataset, task="classification"):
     model.eval()
     preds = []
     gt = []
-    paths = []
 
     with torch.no_grad():
         with tqdm(validate_loader) as _tqdm:
@@ -74,18 +73,29 @@ def validate(validate_loader, model, device, dataset):
                 y = y.to(device)
 
                 outputs = model(x)
-                probs = torch.softmax(outputs, dim=-1).cpu().numpy()
-                preds.append(probs)
+
+                if task == "regression":
+                    pred_batch = outputs.squeeze(1).cpu().numpy()
+                    preds.append(pred_batch)
+                else:
+                    probs = torch.softmax(outputs, dim=-1).cpu().numpy()
+                    preds.append(probs)
+
                 gt.append(y.cpu().numpy())
 
     preds = np.concatenate(preds, axis=0)
     gt = np.concatenate(gt, axis=0)
-    ages = np.arange(0, 101)
-    pred_ages = (preds * ages).sum(axis=-1)
+
+    if task == "regression":
+        pred_ages = preds
+    else:
+        ages = np.arange(0, 101)
+        pred_ages = (preds * ages).sum(axis=-1)
     
+    mae = np.abs(pred_ages - gt).mean()
     # Return image paths and predictions
     paths = dataset.x
-    return pred_ages, paths
+    return pred_ages, paths, mae
 
 
 def apply_weighted_logits(logits_stack, weights=None):
@@ -103,13 +113,14 @@ def apply_weighted_logits(logits_stack, weights=None):
     return weighted
 
 
-def validate_with_tta(validate_loader, model, device, dataset, weights=None):
+def validate_with_tta(validate_loader, model, device, dataset, weights=None, task="classification"):
     """
     If weights is None, uses simple average. Otherwise uses learned weights.
     Returns predicted ages and image paths.
     """
     model.eval()
     all_pred_ages = []
+    all_gt = []
     paths = []
     
     ages = np.arange(0, 101)
@@ -117,6 +128,7 @@ def validate_with_tta(validate_loader, model, device, dataset, weights=None):
     with torch.no_grad():
         with tqdm(validate_loader) as _tqdm:
             for x, y in _tqdm:
+                all_gt.append(y.cpu().numpy())
                 batch_size = x.size(0)
                 for img_idx in range(batch_size):
                     single_img_tensor = x[img_idx].cpu().numpy()
@@ -124,25 +136,43 @@ def validate_with_tta(validate_loader, model, device, dataset, weights=None):
 
                     aug_imgs = generate_tta_versions(single_img, target_size=cfg.MODEL.IMG_SIZE)
 
-                    # Collect logits for all augmentations
-                    logits_list = []
-                    for aug_img in aug_imgs:
-                        aug_img_float = aug_img.astype(np.float32)
-                        tensor = torch.from_numpy(np.transpose(aug_img_float, (2, 0, 1))).unsqueeze(0).to(device)
-                        logits = model(tensor)  # [1, num_classes]
-                        logits_list.append(logits.squeeze(0))
-                    logits_stack = torch.stack(logits_list, dim=0).to(device)  # [num_augs, num_classes]
+                    if task == "regression":
+                        preds_list = []
+                        for aug_img in aug_imgs:
+                            aug_img_float = aug_img.astype(np.float32)
+                            tensor = torch.from_numpy(np.transpose(aug_img_float, (2, 0, 1))).unsqueeze(0).to(device)
+                            pred = model(tensor).squeeze().item()
+                            preds_list.append(pred)
 
-                    # Apply weighting
-                    weighted_logits = apply_weighted_logits(logits_stack, weights)
-                    probs = torch.softmax(weighted_logits, dim=-1).cpu().numpy()
-                    pred_age = (probs * ages).sum()
+                        if weights is not None:
+                            w = torch.softmax(weights, dim=0).cpu().numpy()
+                            pred_age = np.average(preds_list, weights=w)
+                        else:
+                            pred_age = np.mean(preds_list)
+
+                    # Collect logits for all augmentations
+                    else :
+                        logits_list = []
+                        for aug_img in aug_imgs:
+                            aug_img_float = aug_img.astype(np.float32)
+                            tensor = torch.from_numpy(np.transpose(aug_img_float, (2, 0, 1))).unsqueeze(0).to(device)
+                            logits = model(tensor)
+                            logits_list.append(logits.squeeze(0))
+                        logits_stack = torch.stack(logits_list, dim=0).to(device)
+
+                        # Apply weighting
+                        weighted_logits = apply_weighted_logits(logits_stack, weights)
+                        probs = torch.softmax(weighted_logits, dim=-1).cpu().numpy()
+                        pred_age = (probs * ages).sum()
+                    
                     all_pred_ages.append(pred_age)
 
     all_pred_ages = np.array(all_pred_ages)
+    all_gt = np.concatenate(all_gt, axis=0)
+    mae = np.abs(all_pred_ages - all_gt).mean()
     paths = dataset.x
     
-    return all_pred_ages, paths
+    return all_pred_ages, paths, mae
 
 
 def main():
@@ -153,11 +183,6 @@ def main():
 
     cfg.freeze()
 
-    # create model
-    print("=> creating model '{}'".format(cfg.MODEL.ARCH))
-    model = get_model(model_name=cfg.MODEL.ARCH, pretrained=None)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = model.to(device)
 
     # load checkpoint
     resume_path = args.resume
@@ -165,10 +190,18 @@ def main():
     if Path(resume_path).is_file():
         print("=> loading checkpoint '{}'".format(resume_path))
         checkpoint = torch.load(resume_path, map_location="cpu")
-        model.load_state_dict(checkpoint['state_dict'])
+        task = checkpoint.get('task', 'classification')
         print("=> loaded checkpoint '{}'".format(resume_path))
     else:
         raise ValueError("=> no checkpoint found at '{}'".format(resume_path))
+    
+    # create model
+    print("=> creating model '{}' for task '{}'".format(cfg.MODEL.ARCH, task))
+    model = get_model(model_name=cfg.MODEL.ARCH, pretrained=None, task=task)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
+
+    model.load_state_dict(checkpoint['state_dict'])
 
     if device == "cuda":
         cudnn.benchmark = True
@@ -187,13 +220,17 @@ def main():
         print(f"Loaded learned TTA weights from {args.weights} (method: {method})")
         print(f"Weights shape: {weights.shape}")
 
+
     print("=> start testing")
     if args.tta:
-        pred_ages, paths = validate_with_tta(test_loader, model, device, test_dataset, weights=weights)
-        file_name = "image_mean_tta.txt" if not args.weights else "image_mean_tta_weighted.txt"
+        suffix = "weighted" if args.weights else "mean"
+        pred_ages, paths, test_mae = validate_with_tta(test_loader, model, device, test_dataset, weights=weights, task=task)
+        file_name = f"image_tta_{suffix}_{task}.txt"
+        print(f"test mae: {test_mae:.3f}")
     else:
-        pred_ages, paths = validate(test_loader, model, device, test_dataset)
-        file_name = "image_mean_non_tta.txt"
+        pred_ages, paths, test_mae = validate(test_loader, model, device, test_dataset, task=task)
+        file_name = f"image_non_tta_{task}.txt"
+        print(f"test mae: {test_mae:.3f}")
 
     # Save predictions to file
     out_dir = Path("./test_results")

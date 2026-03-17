@@ -31,6 +31,7 @@ def get_args():
     parser.add_argument("--data_dir", type=str, required=True, help="Data root directory")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint if any")
     parser.add_argument("--checkpoint", type=str, default="checkpoint", help="Checkpoint directory")
+    parser.add_argument("--task", type=str, default="classification", help="Task type")
     parser.add_argument("--tensorboard", type=str, default=None, help="Tensorboard log directory")
     parser.add_argument('--multi_gpu', action="store_true", help="Use multi GPUs (data parallel)")
     parser.add_argument("opts", default=[], nargs=argparse.REMAINDER,
@@ -53,7 +54,7 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
-def train(train_loader, model, criterion, optimizer, epoch, device):
+def train(train_loader, model, criterion, optimizer, epoch, device, task="classification"):
     model.train()
     loss_monitor = AverageMeter()
     accuracy_monitor = AverageMeter()
@@ -67,17 +68,20 @@ def train(train_loader, model, criterion, optimizer, epoch, device):
             outputs = model(x)
 
             # calc loss
-            loss = criterion(outputs, y)
+            if task == "regression":
+                loss = criterion(outputs.squeeze(1), y.float())
+            else:
+                loss = criterion(outputs, y)
             cur_loss = loss.item()
 
             # calc accuracy
-            _, predicted = outputs.max(1)
-            correct_num = predicted.eq(y).sum().item()
-
-            # measure accuracy and record loss
             sample_num = x.size(0)
             loss_monitor.update(cur_loss, sample_num)
-            accuracy_monitor.update(correct_num, sample_num)
+
+            if task == "classification":
+                _, predicted = outputs.max(1)
+                correct_num = predicted.eq(y).sum().item()
+                accuracy_monitor.update(correct_num, sample_num)
 
             # compute gradient and do SGD step
             optimizer.zero_grad()
@@ -85,12 +89,13 @@ def train(train_loader, model, criterion, optimizer, epoch, device):
             optimizer.step()
 
             _tqdm.set_postfix(OrderedDict(stage="train", epoch=epoch, loss=loss_monitor.avg),
-                              acc=accuracy_monitor.avg, correct=correct_num, sample_num=sample_num)
+                              acc=accuracy_monitor.avg, correct=0 if task == "regression" else correct_num,
+                              sample_num=sample_num)
 
     return loss_monitor.avg, accuracy_monitor.avg
 
 
-def validate(validate_loader, model, criterion, epoch, device):
+def validate(validate_loader, model, criterion, epoch, device, task="classification"):
     model.eval()
     loss_monitor = AverageMeter()
     accuracy_monitor = AverageMeter()
@@ -102,35 +107,47 @@ def validate(validate_loader, model, criterion, epoch, device):
             for i, (x, y) in enumerate(_tqdm):
                 x = x.to(device)
                 y = y.to(device)
-
+                
                 # compute output
                 outputs = model(x)
-                preds.append(F.softmax(outputs, dim=-1).cpu().numpy())
+
+                if task == "regression":
+                    preds.append(outputs.squeeze(1).cpu().numpy())
+                else:
+                    preds.append(F.softmax(outputs, dim=-1).cpu().numpy())
                 gt.append(y.cpu().numpy())
 
                 # valid for validation, not used for test
                 if criterion is not None:
                     # calc loss
-                    loss = criterion(outputs, y)
+                    if task == "regression":
+                        loss = criterion(outputs.squeeze(1), y.float())
+                    else:
+                        loss = criterion(outputs, y)
+
                     cur_loss = loss.item()
-
-                    # calc accuracy
-                    _, predicted = outputs.max(1)
-                    correct_num = predicted.eq(y).sum().item()
-
-                    # measure accuracy and record loss
                     sample_num = x.size(0)
                     loss_monitor.update(cur_loss, sample_num)
-                    accuracy_monitor.update(correct_num, sample_num)
+
+                    # calc accuracy
+                    if task == "classification":
+                        _, predicted = outputs.max(1)
+                        correct_num = predicted.eq(y).sum().item()
+                        accuracy_monitor.update(correct_num, sample_num)
+
                     _tqdm.set_postfix(OrderedDict(stage="val", epoch=epoch, loss=loss_monitor.avg),
-                                      acc=accuracy_monitor.avg, correct=correct_num, sample_num=sample_num)
+                                      acc=accuracy_monitor.avg, sample_num=sample_num)
 
     preds = np.concatenate(preds, axis=0)
     gt = np.concatenate(gt, axis=0)
-    ages = np.arange(0, 101)
-    ave_preds = (preds * ages).sum(axis=-1)
-    diff = ave_preds - gt
-    mae = np.abs(diff).mean()
+
+    if task == "regression":
+        mae = np.abs(preds - gt).mean()
+    else:
+        ages = np.arange(0, 101)
+        ave_preds = (preds * ages).sum(axis=-1)
+        diff = ave_preds - gt
+        mae = np.abs(diff).mean()
 
     return loss_monitor.avg, accuracy_monitor.avg, mae
 
@@ -148,7 +165,7 @@ def main():
 
     # create model
     print("=> creating model '{}'".format(cfg.MODEL.ARCH))
-    model = get_model(model_name=cfg.MODEL.ARCH)
+    model = get_model(model_name=cfg.MODEL.ARCH, task=args.task)
 
     if cfg.TRAIN.OPT == "sgd":
         optimizer = torch.optim.SGD(model.parameters(), lr=cfg.TRAIN.LR,
@@ -181,9 +198,18 @@ def main():
     if device == "cuda":
         cudnn.benchmark = True
 
-    criterion = nn.CrossEntropyLoss().to(device)
-    train_dataset = FaceDataset(args.data_dir, "train", img_size=cfg.MODEL.IMG_SIZE, augment=True,
-                                age_stddev=cfg.TRAIN.AGE_STDDEV)
+ 
+    if args.task == "regression":
+        criterion = nn.L1Loss().to(device)
+    else:
+        criterion = nn.CrossEntropyLoss().to(device)
+
+    if args.task == "regression":
+        train_dataset = FaceDataset(args.data_dir, "train", img_size=cfg.MODEL.IMG_SIZE, augment=True)
+    else:
+        train_dataset = FaceDataset(args.data_dir, "train", img_size=cfg.MODEL.IMG_SIZE, augment=True,
+                                    age_stddev=cfg.TRAIN.AGE_STDDEV)
+        
     train_loader = DataLoader(train_dataset, batch_size=cfg.TRAIN.BATCH_SIZE, shuffle=True,
                               num_workers=cfg.TRAIN.WORKERS, drop_last=True)
 
@@ -203,10 +229,10 @@ def main():
 
     for epoch in range(start_epoch, cfg.TRAIN.EPOCHS):
         # train
-        train_loss, train_acc = train(train_loader, model, criterion, optimizer, epoch, device)
+        train_loss, train_acc = train(train_loader, model, criterion, optimizer, epoch, device, task=args.task)
 
         # validate
-        val_loss, val_acc, val_mae = validate(val_loader, model, criterion, epoch, device)
+        val_loss, val_acc, val_mae = validate(val_loader, model, criterion, epoch, device, task=args.task)
 
         if args.tensorboard is not None:
             train_writer.add_scalar("loss", train_loss, epoch)
@@ -223,6 +249,7 @@ def main():
                 {
                     'epoch': epoch + 1,
                     'arch': cfg.MODEL.ARCH,
+                    'task': args.task,
                     'state_dict': model_state_dict,
                     'optimizer_state_dict': optimizer.state_dict()
                 },
