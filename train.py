@@ -72,7 +72,7 @@ def train(train_loader, model, criterion, optimizer, epoch, device, task="classi
             if task == "regression":
                 loss = criterion(outputs.squeeze(1), y.float())
             elif task == "ldl":
-                target_dist = make_distribution(y.float(), device, cfg.MODEL.IMG_SIZE)
+                target_dist = make_distribution(y.float(), device, cfg.TRAIN.AGE_STDDEV)
                 log_probs = F.log_softmax(outputs, dim=1)
                 loss = criterion(log_probs, target_dist)
             else:
@@ -135,7 +135,7 @@ def validate(validate_loader, model, criterion, epoch, device, task="classificat
                     if task == "regression":
                         loss = criterion(outputs.squeeze(1), y.float())
                     elif task == "ldl":
-                        target_dist = make_distribution(y.float(), device, cfg.MODEL.IMG_SIZE)
+                        target_dist = make_distribution(y.float(), device, cfg.TRAIN.AGE_STDDEV)
                         log_probs = F.log_softmax(outputs, dim=1)
                         loss = criterion(log_probs, target_dist)
                     else:
