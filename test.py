@@ -175,6 +175,15 @@ def validate_with_tta(validate_loader, model, device, dataset, weights=None, tas
     return all_pred_ages, paths, mae
 
 
+def compute_mae_per_class(preds, y):
+    results = []
+    for cls in range(101):
+        mask = y == cls
+        mae = np.abs(preds[mask] - y[mask]).mean() if mask.any() else None
+        results.append((cls, mae, mask.sum()))
+    return results
+
+
 def main():
     args = get_args()
 
@@ -231,6 +240,16 @@ def main():
         pred_ages, paths, test_mae = validate(test_loader, model, device, test_dataset, task=task)
         file_name = f"image_non_tta_{task}.txt"
         print(f"test mae: {test_mae:.3f}")
+        
+    mae_per_class = compute_mae_per_class(pred_ages, np.array(test_dataset.y))
+        
+    interval_size = 10
+    for i in range(0, 100, interval_size):
+        interval_maes = [mae for cls, mae, count in mae_per_class[i:i+interval_size] if mae is not None]
+        interval_mae = np.mean(interval_maes) if interval_maes else None
+        
+        print(f"{i:3d} - {i+interval_size-1:3d} : MAE = {interval_mae}")
+
 
     # Save predictions to file
     out_dir = Path("./test_results")

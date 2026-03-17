@@ -31,7 +31,8 @@ def get_args():
     parser.add_argument("--data_dir", type=str, required=True, help="Data root directory")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint if any")
     parser.add_argument("--checkpoint", type=str, default="checkpoint", help="Checkpoint directory")
-    parser.add_argument("--task", type=str, default="classification", help="Task type")
+    parser.add_argument("--task", type=str, default="classification", help="Task type (classification, regression, or regression)")
+    parser.add_argument("--weightsample", action="store_true", help="add weight to low frequency classes")
     parser.add_argument("--tensorboard", type=str, default=None, help="Tensorboard log directory")
     parser.add_argument('--multi_gpu', action="store_true", help="Use multi GPUs (data parallel)")
     parser.add_argument("opts", default=[], nargs=argparse.REMAINDER,
@@ -71,7 +72,7 @@ def train(train_loader, model, criterion, optimizer, epoch, device, task="classi
             if task == "regression":
                 loss = criterion(outputs.squeeze(1), y.float())
             elif task == "ldl":
-                target_dist = make_distribution(y.float(), device, cfg.TRAIN.AGE_STDDEV)
+                target_dist = make_distribution(y.float(), device, cfg.MODEL.IMG_SIZE)
                 log_probs = F.log_softmax(outputs, dim=1)
                 loss = criterion(log_probs, target_dist)
             else:
@@ -101,6 +102,7 @@ def train(train_loader, model, criterion, optimizer, epoch, device, task="classi
 def make_distribution(y, device, std=3.0):
     ages = torch.arange(0, 101).float().to(device)
     y = y.unsqueeze(1)
+    #std = y**.5 + 1e-3
     dist = torch.exp(-(ages - y)**2 / (2 * std**2))
     dist = dist / dist.sum(dim=1, keepdim=True)
     return dist
@@ -133,7 +135,7 @@ def validate(validate_loader, model, criterion, epoch, device, task="classificat
                     if task == "regression":
                         loss = criterion(outputs.squeeze(1), y.float())
                     elif task == "ldl":
-                        target_dist = make_distribution(y.float(), device, cfg.TRAIN.AGE_STDDEV)
+                        target_dist = make_distribution(y.float(), device, cfg.MODEL.IMG_SIZE)
                         log_probs = F.log_softmax(outputs, dim=1)
                         loss = criterion(log_probs, target_dist)
                     else:
@@ -229,7 +231,7 @@ def main():
         train_dataset = FaceDataset(args.data_dir, "train", img_size=cfg.MODEL.IMG_SIZE, augment=True,
                                     age_stddev=cfg.TRAIN.AGE_STDDEV)
         
-    if(True):
+    if(args.weightsample):
         labels = np.array(train_dataset.y).astype(int)
         age_counts = np.bincount(labels, minlength=101)
         age_counts[age_counts == 0] = 1
