@@ -19,39 +19,42 @@ def read_predictions(filepath):
 
     return predictions
 
-def compare_predictions(file1, file2):
+def compare_predictions(file1, file2, actual_values):
     """
-    Compare two prediction files.
+    Compare two prediction files with actual values
     Returns:
-        corrected: list of images where file2.mean < file1.mean
-        corrupted: list of images where file2.mean > file1.mean
-        unchanged: list of images where means are equal
+        corrected: list of images where the prediction is better in file2 compared to file1
+        corrupted: list of images where the prediction is degraded in file2 compared to file1
+        unchanged: list of images where the prediction is the same
     """
     pred1 = read_predictions(file1)
     pred2 = read_predictions(file2)
+    data = read_predictions(actual_values)
     
-    common_images = set(pred1.keys()) & set(pred2.keys())
+    common_images = set(pred1.keys()) & set(pred2.keys()) & set(data.keys())
     
     corrected = []
     corrupted = []
     unchanged = []
     
     for image_name in common_images:
-        mean1 = pred1[image_name]
-        mean2 = pred2[image_name]
+        value = data[image_name]
+        diff1 = abs(value - pred1[image_name])
+        diff2 = abs(value - pred2[image_name])
         
-        if mean2 < mean1:
+        
+        if diff2 < diff1:
             corrected.append(image_name)
-        elif mean2 > mean1:
+        elif diff2 > diff1:
             corrupted.append(image_name)
         else:
             unchanged.append(image_name)
     
     return corrected, corrupted, unchanged
 
-def plot_corrected_corrupted(file1, file2):
+def plot_corrected_corrupted(file1, file2, actual_values):
     # Compare predictions
-    corrected, corrupted, unchanged = compare_predictions(file1, file2)
+    corrected, corrupted, unchanged = compare_predictions(file1, file2, actual_values)
     
     corrected_count = len(corrected)
     corrupted_count = len(corrupted)
@@ -73,5 +76,8 @@ def plot_corrected_corrupted(file1, file2):
     plt.grid(axis='y', linestyle='--', alpha=0.7)
 
     plt.show()
+    #plt.savefig("corrected_vs_corrupted2.png")
 
     return corrected, corrupted, unchanged
+
+#plot_corrected_corrupted("test_results/image_mean_non_tta.txt", "test_results/image_mean_tta_weighted.txt", "test_results/apparents_ages.txt")
