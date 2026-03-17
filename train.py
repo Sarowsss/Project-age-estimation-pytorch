@@ -70,6 +70,10 @@ def train(train_loader, model, criterion, optimizer, epoch, device, task="classi
             # calc loss
             if task == "regression":
                 loss = criterion(outputs.squeeze(1), y.float())
+            elif task == "ldl":
+                target_dist = make_distribution(y.float(), device, cfg.TRAIN.AGE_STDDEV)
+                log_probs = F.log_softmax(outputs, dim=1)
+                loss = criterion(log_probs, target_dist)
             else:
                 loss = criterion(outputs, y)
             cur_loss = loss.item()
@@ -78,7 +82,7 @@ def train(train_loader, model, criterion, optimizer, epoch, device, task="classi
             sample_num = x.size(0)
             loss_monitor.update(cur_loss, sample_num)
 
-            if task == "classification":
+            if task == "classification" or task == "ldl":
                 _, predicted = outputs.max(1)
                 correct_num = predicted.eq(y).sum().item()
                 accuracy_monitor.update(correct_num, sample_num)
@@ -94,6 +98,12 @@ def train(train_loader, model, criterion, optimizer, epoch, device, task="classi
 
     return loss_monitor.avg, accuracy_monitor.avg
 
+def make_distribution(y, device, std=3.0):
+    ages = torch.arange(0, 101).float().to(device)
+    y = y.unsqueeze(1)
+    dist = torch.exp(-(ages - y)**2 / (2 * std**2))
+    dist = dist / dist.sum(dim=1, keepdim=True)
+    return dist
 
 def validate(validate_loader, model, criterion, epoch, device, task="classification"):
     model.eval()
@@ -122,6 +132,10 @@ def validate(validate_loader, model, criterion, epoch, device, task="classificat
                     # calc loss
                     if task == "regression":
                         loss = criterion(outputs.squeeze(1), y.float())
+                    elif task == "ldl":
+                        target_dist = make_distribution(y.float(), device, cfg.TRAIN.AGE_STDDEV)
+                        log_probs = F.log_softmax(outputs, dim=1)
+                        loss = criterion(log_probs, target_dist)
                     else:
                         loss = criterion(outputs, y)
 
@@ -130,7 +144,7 @@ def validate(validate_loader, model, criterion, epoch, device, task="classificat
                     loss_monitor.update(cur_loss, sample_num)
 
                     # calc accuracy
-                    if task == "classification":
+                    if task == "classification" or task=="ldl":
                         _, predicted = outputs.max(1)
                         correct_num = predicted.eq(y).sum().item()
                         accuracy_monitor.update(correct_num, sample_num)
@@ -201,16 +215,38 @@ def main():
  
     if args.task == "regression":
         criterion = nn.L1Loss().to(device)
+    elif args.task == "ldl":
+        criterion = nn.KLDivLoss(reduction='batchmean')
     else:
         criterion = nn.CrossEntropyLoss().to(device)
 
     if args.task == "regression":
         train_dataset = FaceDataset(args.data_dir, "train", img_size=cfg.MODEL.IMG_SIZE, augment=True)
+    elif args.task == "ldl":
+        train_dataset = FaceDataset(args.data_dir, "train", img_size=cfg.MODEL.IMG_SIZE, augment=True,
+                                    age_stddev=cfg.TRAIN.AGE_STDDEV)
     else:
         train_dataset = FaceDataset(args.data_dir, "train", img_size=cfg.MODEL.IMG_SIZE, augment=True,
                                     age_stddev=cfg.TRAIN.AGE_STDDEV)
         
-    train_loader = DataLoader(train_dataset, batch_size=cfg.TRAIN.BATCH_SIZE, shuffle=True,
+    if(True):
+        labels = np.array(train_dataset.y).astype(int)
+        age_counts = np.bincount(labels, minlength=101)
+        age_counts[age_counts == 0] = 1
+        weights = 1.0 / (age_counts**.5)
+        #class_weights = torch.tensor(weights, dtype=torch.float32).to(device)
+        sample_weights = weights[labels]
+
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True
+        )
+
+        train_loader = DataLoader(train_dataset, batch_size=cfg.TRAIN.BATCH_SIZE, sampler=sampler,
+                              num_workers=cfg.TRAIN.WORKERS, drop_last=True)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=cfg.TRAIN.BATCH_SIZE, shuffle=True,
                               num_workers=cfg.TRAIN.WORKERS, drop_last=True)
 
     val_dataset = FaceDataset(args.data_dir, "valid", img_size=cfg.MODEL.IMG_SIZE, augment=False)
